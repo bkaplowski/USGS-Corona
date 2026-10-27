@@ -213,14 +213,26 @@ CAMERAS = {
     "kh4-A": Camera("KH-4 aft panoramic camera", 35.0, "TL=SE,TR=SW", 5000.0),
     "kh9-F": Camera("KH-9 forward panoramic camera", 60.0, None, 10000.0),
     "kh9-A": Camera("KH-9 aft panoramic camera", 60.0, "TL=SE,TR=SW", 10000.0),
+    # Declass 2. KH-7 GAMBIT is a strip camera and the KH-9 mapping camera a
+    # frame camera: neither has panoramic distortion.
+    "kh7": Camera("KH-7 GAMBIT strip camera", 0.0, None, 2000.0),
+    "kh9-map": Camera("KH-9 mapping camera", 0.0, None, 2000.0),
     "unknown": Camera("unknown camera", 0.0, None, 1000.0),
 }
 
 
 def camera_of(scene: "Scene") -> Camera:
     """KH-4 ids look like DS1101-2157DF028, HEXAGON like D3C1217-100011F024 (the
-    letter before the frame number is the camera), ARGON like DS09066A063MC071."""
+    letter before the frame number is the camera), ARGON like DS09066A063MC071,
+    Declass 2 like DZB00402700011H021001 (H = KH-7, L = KH-9 mapping camera)."""
     d = scene.display_id
+    if d.startswith("DZB"):
+        kind = str(scene.metadata.get("Camera Type") or "")
+        if "KH-7" in kind or (not kind and len(d) > 14 and d[14] == "H"):
+            return CAMERAS["kh7"]
+        if "Mapping" in kind or (not kind and len(d) > 14 and d[14] == "L"):
+            return CAMERAS["kh9-map"]
+        return CAMERAS["unknown"]
     cam = str(scene.metadata.get("Camera Type") or scene.metadata.get("Camera") or "")[:1].upper()
     if not cam and len(d) > 4:
         cam = d[-4].upper()
