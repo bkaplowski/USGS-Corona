@@ -192,12 +192,15 @@ class Camera:
         USGS overlay cannot tell us; None if not yet verified for this camera.
     margin_m: typical error of the corner-based geolocation, used as the
         default crop margin.
+    own_overlay_ok: False when USGS's overlay for this camera is known to be
+        misplaced; overlapping CORONA overlays are used as the reference instead.
     """
 
     name: str
     pan_deg: float = 0.0
     orientation: str | None = None
     margin_m: float = 1000.0
+    own_overlay_ok: bool = True
 
 
 # Orientations verified on real scans: ARGON against the USGS overlay
@@ -214,8 +217,11 @@ CAMERAS = {
     "kh9-F": Camera("KH-9 forward panoramic camera", 60.0, None, 10000.0),
     "kh9-A": Camera("KH-9 aft panoramic camera", 60.0, "TL=SE,TR=SW", 10000.0),
     # Declass 2. KH-7 GAMBIT is a strip camera and the KH-9 mapping camera a
-    # frame camera: neither has panoramic distortion.
-    "kh7": Camera("KH-7 GAMBIT strip camera", 0.0, None, 2000.0),
+    # frame camera: neither has panoramic distortion. KH-7 checked on
+    # DZB00402700011H021001 (Rabat, 1966): the coast and the Bou Regreg mouth
+    # put it at TL=SW, placement ~6 km off; USGS's own overlay of that frame is
+    # rotated 180 degrees, so it is not used.
+    "kh7": Camera("KH-7 GAMBIT strip camera", 0.0, "TL=SW,TR=NW", 6000.0, own_overlay_ok=False),
     "kh9-map": Camera("KH-9 mapping camera", 0.0, None, 2000.0),
     "unknown": Camera("unknown camera", 0.0, None, 1000.0),
 }
@@ -989,14 +995,15 @@ def assemble_scan(paths: list[Path]) -> StripMosaic:
     """Join the TIFF parts of a scan in the order that makes one continuous photo.
 
     USGS names the parts _a, _b, ...; on the KH-4 scans we checked, the parts run
-    in reverse order along the strip (_a holds the end with the title block).
-    Joined in the wrong order, the title block and film clips land inside the
-    photo, so we keep the order that leaves no such gaps (reverse on a tie).
+    in reverse order along the strip (_a holds the end with the title block),
+    while KH-9 and KH-7 parts run in name order. Joined in the wrong order, the
+    title block and film clips land inside the photo, so we keep the order that
+    leaves no such gaps (name order on a tie).
     """
     if len(paths) < 2:
         return StripMosaic(paths)
     best = None
-    for order in (paths[::-1], paths):
+    for order in (paths, paths[::-1]):
         m = StripMosaic(order)
         frame = detect_frame(m)
         n_gaps = len(detect_gaps(m, frame)) if frame else 99
@@ -1026,9 +1033,13 @@ def write_geotiff(path: Path, data: np.ndarray, geo_affine: np.ndarray | None) -
     tifffile.imwrite(path, data, photometric=photometric, extratags=extratags, compression="zlib")
 
 
-def to_preview(data: np.ndarray) -> Image.Image:
-    """Contrast-stretch to 8 bit for PNG previews."""
-    a = np.asarray(data, dtype=float)
+def to_preview(data: np.ndarray, max_px: int | None = None) -> Image.Image:
+    """Contrast-stretch to 8 bit for PNG previews, decimating first to at most
+    max_px on the long side (a full-resolution window can be gigabytes)."""
+    if max_px:
+        step = max(1, -(-max(data.shape[:2]) // max_px))
+        data = data[::step, ::step]
+    a = np.asarray(data, dtype=np.float32)
     if a.ndim == 3 and a.shape[2] == 1:
         a = a[..., 0]
     valid = a[a > 0] if np.any(a > 0) else a.ravel()
@@ -1078,7 +1089,7 @@ def fetch_overlay(scene: Scene, long_side: int = 800, timeout: float = 60.0):
     """
     url = next((b.get("overlayPath") for b in scene.raw.get("browse") or []
                 if b.get("overlayPath") and "wms" in str(b.get("overlayType", "")).lower()), None)
-    if url:
+    if url and camera_of(scene).own_overlay_ok:
         base, _, query = url.partition("?")
         q = dict(kv.partition("=")[::2] for kv in query.split("&"))
         q = {k.lower(): v for k, v in q.items()}
@@ -1299,9 +1310,7 @@ def crop_scene(
         write_geotiff(tif, data, geo_affine)
         files["geotiff"] = tif.name
         png = out_dir / f"{tag}.png"
-        preview = to_preview(data)
-        preview.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX))
-        preview.save(png)
+        to_preview(data, PREVIEW_MAX_PX).save(png)
         files["preview"] = png.name
 
         # Context preview: a wider window, decimated, with the target box drawn.
@@ -1513,7 +1522,8 @@ def run(args) -> int:
             point_dir = out_root / _slug(p.name)
             point_dir.mkdir(parents=True, exist_ok=True)
             for s, prod in selected:
-                if not _has_wms_overlay(s) and args.orientation in ("auto", "all"):
+                if (not _has_wms_overlay(s) or not camera_of(s).own_overlay_ok) \
+                        and args.orientation in ("auto", "all"):
                     lats = [c[0] for c in s.corners.values()]
                     lons = [c[1] for c in s.corners.values()]
                     try:

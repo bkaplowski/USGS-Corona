@@ -209,6 +209,8 @@ def test_panoramic_model_compresses_strip_ends():
     ("DS1043-2157DA014", {}, "kh4-A"),
     ("D3C1217-100011F024", {"Camera": "F"}, "kh9-F"),
     ("DS09066A063MC071", {}, "argon"),
+    ("DZB00402700011H021001", {"Camera Type": "KH-7 High Resolution Surveillance"}, "kh7"),
+    ("DZB1214-500259L002001", {"Camera Type": "KH-9 Lower Resolution Mapping"}, "kh9-map"),
     ("XYZ", {}, "unknown"),
 ])
 def test_camera_of(display_id, meta, key):
@@ -231,3 +233,19 @@ def test_assemble_scan_puts_title_block_at_strip_end(tmp_path):
         paths.append(tmp_path / name)
     m = cf.assemble_scan(paths)
     assert [p.name for p in m.paths] == ["s_b.tif", "s_a.tif"]
+
+
+def test_assemble_scan_keeps_name_order_when_both_orders_are_clean(tmp_path):
+    rng = np.random.default_rng(4)
+    paths = []
+    for name in ("g_a.tif", "g_b.tif", "g_c.tif"):
+        tifffile.imwrite(tmp_path / name, rng.integers(60, 220, (200, 900), dtype=np.uint8))
+        paths.append(tmp_path / name)
+    assert [p.name for p in cf.assemble_scan(paths).paths] == ["g_a.tif", "g_b.tif", "g_c.tif"]
+
+
+def test_to_preview_decimates_before_converting():
+    big = np.zeros((9000, 5000), np.uint8)
+    big[::2] = 200
+    im = cf.to_preview(big, max_px=1000)
+    assert max(im.size) <= 1000

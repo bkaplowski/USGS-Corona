@@ -10,6 +10,8 @@ each input coordinate. To hand it to another project, copy `corona_fetch.py` and
 | `declassiii` (default, tried first) | KH-9 HEXAGON panoramic | 1971-84 | 0.6-1.2 m |
 | `corona2` (default, fallback) | CORONA KH-4/4A/4B panoramic | 1960-72 | ~2 m |
 | `corona2` | ARGON (KH-5) frame camera | 1962-64 | ~30 m (ranked last) |
+| `declassii` (opt-in) | KH-7 GAMBIT strip camera | 1963-67 | ~0.5 m (0.48 m measured) |
+| `declassii` (opt-in) | KH-9 mapping camera | 1973-80 | 6-9 m |
 
 ## Setup
 
@@ -76,6 +78,8 @@ film from those corners plus a panoramic camera model. Measured on real scans:
 | ARGON | not measured (frame camera, ~30 m pixels) | 1 km |
 | KH-4 (CORONA) | 1-5 km (Pentagon, two frames) | 5 km |
 | KH-9 (HEXAGON) | ~7-10 km near the strip end (Ouarzazate) | 10 km |
+| KH-7 (GAMBIT) | ~6 km (Rabat, 1966) | 6 km |
+| KH-9 mapping camera | not measured | 2 km |
 
 So the window is a 1 km box plus the margin: the target is inside it, **not at
 its centre**. Find the exact spot in the preview by eye, or co-register the
@@ -91,13 +95,33 @@ Film orientation (which way is north) is not in the metadata either:
 | KH-4 aft | TL=SE (180 deg) | Pentagon in DS1043-2157DA014 |
 | KH-9 aft | TL=SE (180 deg) | El Mansour Eddahbi reservoir in D3C1212-100087A023 |
 | KH-9 forward | **unknown**: all candidates are written | none yet |
+| KH-7 GAMBIT | TL=SW | Rabat coast and Bou Regreg mouth in DZB00402700011H021001 |
+| KH-9 mapping camera | **unknown**: all candidates are written | none yet |
+
+USGS's own overlay of the KH-7 frame above is rotated 180 degrees, so for KH-7
+the script ignores it and uses overlapping CORONA overlays instead.
 
 If the overlay match is conclusive it overrides these defaults. Check the north
 arrow in the context preview.
 
 Other things the script handles: multi-part scans are joined in the order that
-leaves no title-block gaps (KH-4 parts run `_d.._a` along the strip, KH-9 parts
-`_a.._g`), and the photo frame is detected inside the film border.
+leaves no title-block gaps (KH-4 parts run `_d.._a` along the strip, KH-9 and
+KH-7 parts in name order), and the photo frame is detected inside the film border.
+
+KH-7 scans hold several film segments side by side, each with its own title
+block, and a window can straddle two of them. The geometry treats the scan as
+one strip, which is part of the ~6 km error. At 0.5 m/px a KH-7 window with the
+6 km margin is ~38000 x 21000 px (a ~650 MB GeoTIFF); plan disk accordingly or
+pass a smaller `--margin-m` once you know the offset.
+
+## Earliest sources for Morocco
+
+Declass 2 (`--dataset declassii`) is not searched by default. It holds the
+earliest sharp imagery, KH-7 GAMBIT from 1966, downloadable now for Tangier
+(1966-05-15, 1966-09-17), Rabat (1966-04-20) and Agadir (1966-04-20). It also
+holds KH-9 mapping-camera frames (1976-79) for Ouarzazate, Errachidia and
+Agadir. For accurately map-aligned imagery, Landsat MSS (60 m) covers every
+example point from August 1972 (not handled by this script).
 
 ## Morocco coverage (1970s, example points)
 
