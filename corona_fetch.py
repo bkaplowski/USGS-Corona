@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
-"""Download CORONA (KH-1 .. KH-4B) imagery around a set of coordinates.
+"""Download declassified spy-satellite imagery (KH-9 HEXAGON, CORONA, ARGON)
+around a set of coordinates.
 
 For every point you give it, this script:
 
   1. logs in to the USGS EROS M2M API with an application token,
-  2. searches the CORONA dataset (``corona2`` / "Declassified Data - Declass 1")
-     for frames whose footprint contains the point,
-  3. requests and downloads the full-resolution film scan for the best
-     matching frame(s) (each scan is a .tgz of one or more TIFF strips),
-  4. cuts out an ~1 km x 1 km window around the point, and
-  5. writes the cut-out as an (approximately) georeferenced GeoTIFF, a PNG
-     preview, a ~10 km context preview with the target box drawn on it, and a
-     JSON sidecar describing what was done.
+  2. searches the declassified datasets, in order of preference (default
+     ``declassiii`` = KH-9 HEXAGON 1971-84, 0.6-1.2 m, then ``corona2`` =
+     CORONA KH-4 1960-72, ~2 m, and ARGON, ~30 m), for frames whose footprint
+     contains the point,
+  3. downloads the full-resolution film scan of the best downloadable frame(s)
+     (0.5-7 GB each; cached, so reruns are fast),
+  4. finds the photo inside the scan, assembles multi-part scans, and maps the
+     point onto the film with the USGS footprint corners and a panoramic camera
+     model,
+  5. writes the window around the point as an approximately georeferenced
+     GeoTIFF (WGS84), a PNG preview, a wider context preview with the window
+     drawn on it, and a JSON sidecar.
 
-CORONA scans are *not* georeferenced. The only geolocation USGS supplies is the
-four footprint corner coordinates in the scene metadata, so the cut-out is
-located with a projective transform (homography) fitted to those corners. The
-panoramic camera geometry means this is an approximation: expect the window to
-be off by a few hundred metres, more near the ends of a strip. Use
-``--margin-m`` to grow the window, and check the context preview.
+Accuracy
+--------
+The scans are not georeferenced; the only geolocation USGS supplies is the four
+footprint corners. Measured errors: 1-5 km for KH-4, up to ~10 km for KH-9 near
+the ends of its strip. The window therefore has a per-camera margin (1 km ARGON,
+5 km KH-4, 10 km KH-9; override with ``--margin-m``) so the target is inside it,
+not at its centre. Always check the context preview.
+
+The film's orientation relative to north is not in the metadata. It is taken
+from a match against USGS's georeferenced browse overlays when that is
+conclusive, else from per-camera conventions verified on real scans (see
+CAMERAS). Where no convention is known (KH-9 forward camera), every candidate
+orientation is written.
+
+Frames that USGS has not scanned yet cannot be downloaded; they are listed with
+``downloadAvailable: false`` and can be ordered in EarthExplorer.
 
 Credentials
 -----------
@@ -32,14 +47,16 @@ or pass ``--username`` and enter the token at the prompt.
 
 Examples
 --------
-    # one point, newest available frame, 1 km window
-    ./corona_fetch.py --point 37.2343,-115.8067
+    # what is available for a list of points in the 1970s, download nothing
+    ./corona_fetch.py --points-file examples/morocco_points.csv \
+        --start 1970-01-01 --end 1979-12-31 --dry-run
 
-    # many points from a CSV with columns name,lat,lon
-    ./corona_fetch.py --points-file sites.csv --max-scenes 2 --out ./corona
+    # download and cut out the best 1970s frame for each point
+    ./corona_fetch.py --points-file examples/morocco_points.csv \
+        --start 1970-01-01 --end 1979-12-31 --out ./declass_morocco
 
-    # just list what is available, download nothing
-    ./corona_fetch.py --point 30.0444,31.2357 --dry-run
+    # CORONA only, one point
+    ./corona_fetch.py --dataset corona2 --point 34.0209,-6.8416
 """
 
 from __future__ import annotations
@@ -79,6 +96,7 @@ WMS_URL = "https://ims.cr.usgs.gov/wms.py"
 EARTH_RADIUS_M = 6371008.8
 CORNERS = ("NW", "NE", "SE", "SW")
 TIFF_SUFFIXES = (".tif", ".tiff", ".ntf")
+PREVIEW_MAX_PX = 4000  # PNG previews are downsampled to this; the GeoTIFF keeps full resolution
 
 
 # --------------------------------------------------------------------------- #
@@ -184,13 +202,17 @@ class Camera:
 
 # Orientations verified on real scans: ARGON against the USGS overlay
 # (DS09066A063MC071, r=0.74); KH-4 forward/aft by locating the Pentagon in
-# DS1101-2157DF028 and DS1043-2157DA014, where the placement error was 1-5 km (hence the 5 km margin).
+# DS1101-2157DF028 and DS1043-2157DA014, where the placement error was 1-5 km
+# (hence the 5 km margin); KH-9 aft by matching the El Mansour Eddahbi
+# reservoir in D3C1212-100087A023, which landed ~7-10 km off near the strip
+# end (hence the 10 km margin).
+# KH-9 forward is unverified, so every orientation is written for it.
 CAMERAS = {
     "argon": Camera("ARGON (KH-5) frame camera", 0.0, "TL=SE,TR=SW", 1000.0),
     "kh4-F": Camera("KH-4 forward panoramic camera", 35.0, "TL=NW,TR=NE", 5000.0),
     "kh4-A": Camera("KH-4 aft panoramic camera", 35.0, "TL=SE,TR=SW", 5000.0),
-    "kh9-F": Camera("KH-9 forward panoramic camera", 60.0, None, 3000.0),
-    "kh9-A": Camera("KH-9 aft panoramic camera", 60.0, None, 3000.0),
+    "kh9-F": Camera("KH-9 forward panoramic camera", 60.0, None, 10000.0),
+    "kh9-A": Camera("KH-9 aft panoramic camera", 60.0, "TL=SE,TR=SW", 10000.0),
     "unknown": Camera("unknown camera", 0.0, None, 1000.0),
 }
 
@@ -1044,9 +1066,16 @@ def fetch_overlay(scene: Scene, long_side: int = 800, timeout: float = 60.0):
     """
     url = next((b.get("overlayPath") for b in scene.raw.get("browse") or []
                 if b.get("overlayPath") and "wms" in str(b.get("overlayType", "")).lower()), None)
-    if not url and scene.reference_layers:
-        url = f"{WMS_URL}?map=declassi&layers={','.join(scene.reference_layers)}"
-    if not url:
+    if url:
+        base, _, query = url.partition("?")
+        q = dict(kv.partition("=")[::2] for kv in query.split("&"))
+        q = {k.lower(): v for k, v in q.items()}
+        requests_ = [(base, q.get("map", "declassi"), q.get("layers", ""))]
+    else:
+        # One request per layer: the server rejects a whole request if any
+        # one layer is missing.
+        requests_ = [(WMS_URL, "declassi", layer) for layer in scene.reference_layers]
+    if not requests_:
         return None
     lats = [c[0] for c in scene.corners.values()]
     lons = [c[1] for c in scene.corners.values()]
@@ -1054,25 +1083,25 @@ def fetch_overlay(scene: Scene, long_side: int = 800, timeout: float = 60.0):
     aspect = (e - w) * math.cos(math.radians((s + n) / 2)) / max(n - s, 1e-9)
     width = int(long_side if aspect >= 1 else max(16, long_side * aspect))
     height = int(long_side if aspect < 1 else max(16, long_side / aspect))
-    params = {"service": "WMS", "version": "1.1.1", "request": "GetMap", "srs": "EPSG:4326",
-              "bbox": f"{w},{s},{e},{n}", "width": width, "height": height,
-              "format": "image/png", "styles": "", "transparent": "true"}
-    base, _, query = url.partition("?")
-    for kv in query.split("&"):
-        k, _, v = kv.partition("=")
-        if k.lower() in ("map", "layers"):
-            params[k.lower()] = v
-    try:
-        r = requests.get(base, params=params, timeout=timeout)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-    except (requests.RequestException, OSError) as e:
-        log.info("[%s] no USGS overlay for orientation check: %s", scene.display_id, e)
-        return None
-    a = np.asarray(img, dtype=np.float32)
-    grey, valid = a[..., :3].mean(axis=2), a[..., 3] > 0
-    valid &= grey > 0
+    grey = np.zeros((height, width), dtype=np.float32)
+    valid = np.zeros((height, width), dtype=bool)
+    for base, wms_map, layers in requests_:
+        params = {"service": "WMS", "version": "1.1.1", "request": "GetMap", "srs": "EPSG:4326",
+                  "bbox": f"{w},{s},{e},{n}", "width": width, "height": height,
+                  "format": "image/png", "styles": "", "transparent": "true",
+                  "map": wms_map, "layers": layers}
+        try:
+            r = requests.get(base, params=params, timeout=timeout)
+            r.raise_for_status()
+            a = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGBA"), dtype=np.float32)
+        except (requests.RequestException, OSError) as err:
+            log.debug("[%s] overlay %s unavailable: %s", scene.display_id, layers, err)
+            continue
+        g = a[..., :3].mean(axis=2)
+        new = (a[..., 3] > 0) & (g > 0) & ~valid
+        grey[new], valid[new] = g[new], True
     if valid.sum() < 100:
+        log.info("[%s] no USGS overlay for the orientation check", scene.display_id)
         return None
     lon_g, lat_g = np.meshgrid(np.linspace(w, e, width), np.linspace(n, s, height))
     return grey, valid, lat_g, lon_g
@@ -1191,9 +1220,10 @@ def crop_scene(
     elif orientation == "auto":
         chosen = cands[:1]
         if source == "unverified":
-            log.warning("[%s] orientation unverified for %s; assuming %s (check the context "
-                        "preview, or use --orientation all)", scene.display_id, camera.name,
-                        chosen[0][0])
+            chosen = cands
+            log.warning("[%s] orientation unknown for %s; writing all %d candidates, pick the "
+                        "right one from the context previews", scene.display_id, camera.name,
+                        len(cands))
         else:
             log.info("[%s] orientation %s (%s)", scene.display_id, chosen[0][0], source)
     else:
@@ -1257,7 +1287,9 @@ def crop_scene(
         write_geotiff(tif, data, geo_affine)
         files["geotiff"] = tif.name
         png = out_dir / f"{tag}.png"
-        to_preview(data).save(png)
+        preview = to_preview(data)
+        preview.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX))
+        preview.save(png)
         files["preview"] = png.name
 
         # Context preview: a wider window, decimated, with the target box drawn.
@@ -1565,10 +1597,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--size-m", type=float, default=1000.0, help="side of the square window, metres")
     g.add_argument("--margin-m", type=float, default=None,
                    help="extra margin on each side to absorb geolocation error, metres "
-                        "(default: per camera, 1 km for ARGON, 5 km for KH-4, 3 km for KH-9)")
+                        "(default: per camera, 1 km for ARGON, 5 km for KH-4, 10 km for KH-9)")
     g.add_argument("--pan-angle", type=float, default=None,
                    help="override the panoramic half scan angle in degrees (0 = frame camera)")
-    g.add_argument("--context-m", type=float, default=10000.0,
+    g.add_argument("--context-m", type=float, default=30000.0,
                    help="side of the context preview, metres (0 disables)")
     g.add_argument("--orientation", default="auto",
                    help="how the scan sits relative to north: 'auto' (north-up, unmirrored), 'all' "

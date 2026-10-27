@@ -1,7 +1,7 @@
 """Live tests against the real USGS M2M API.
 
 Skipped unless M2M_USERNAME and M2M_TOKEN are set. Set CORONA_LIVE_DOWNLOAD=1 to
-also download one full scan (0.5-2 GB) and crop it.
+also download one full scan and crop it.
 
     CORONA_TEST_POINT=37.2343,-115.8067 python3 -m pytest -q tests/test_live.py -s
 """
@@ -35,7 +35,9 @@ def test_live_search(tmp_path):
 @pytest.mark.skipif(not os.environ.get("CORONA_LIVE_DOWNLOAD"), reason="set CORONA_LIVE_DOWNLOAD=1")
 def test_live_download_and_crop(tmp_path):
     out = Path(os.environ.get("CORONA_LIVE_OUT", tmp_path))
-    rc = cf.main(["--point", POINT, "--out", str(out), "--orientation", "all", "--margin-m", "500"])
+    # corona2 only: at the default point that is a ~300 MB ARGON scan, where the
+    # default HEXAGON-first search would fetch 4-7 GB.
+    rc = cf.main(["--point", POINT, "--out", str(out), "--dataset", "corona2"])
     assert rc == 0
     crops = list((out / "pt1").glob("*.tif"))
     print("\n".join(str(c) for c in crops))

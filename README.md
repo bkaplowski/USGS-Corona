@@ -1,53 +1,134 @@
-# USGS CORONA fetch
+# Declassified imagery fetch (HEXAGON / CORONA / ARGON)
 
-`corona_fetch.py` downloads declassified CORONA (KH-1 to KH-4B) film scans from the
-USGS EROS M2M API and cuts out a ~1 km x 1 km window around each input coordinate.
+`corona_fetch.py` is a single-file tool that downloads declassified spy-satellite
+film scans from the USGS EROS M2M API and cuts out a georeferenced window around
+each input coordinate. To hand it to another project, copy `corona_fetch.py` and
+`requirements.txt`; nothing else is needed at runtime.
+
+| Dataset (`--dataset`) | System | Years | Ground resolution |
+|---|---|---|---|
+| `declassiii` (default, tried first) | KH-9 HEXAGON panoramic | 1971-84 | 0.6-1.2 m |
+| `corona2` (default, fallback) | CORONA KH-4/4A/4B panoramic | 1960-72 | ~2 m |
+| `corona2` | ARGON (KH-5) frame camera | 1962-64 | ~30 m (ranked last) |
 
 ## Setup
 
 ```
-pip install -r requirements.txt
+pip install -r requirements.txt          # numpy, requests, tifffile, Pillow
 export M2M_USERNAME=<ERS username>
-export M2M_TOKEN=<M2M application token>   # ers.cr.usgs.gov -> Profile -> Application Tokens
+export M2M_TOKEN=<M2M application token> # ers.cr.usgs.gov -> Profile -> Application Tokens
 ```
+
+Disk: each scan is 0.5-7 GB and is kept in `<out>/_scenes/` so reruns are fast
+(`--delete-scenes` removes it after cropping). Each output GeoTIFF is up to a
+few hundred MB because of the error margins below.
 
 ## Usage
 
+Points go in a CSV with columns `name,lat,lon` (see `examples/morocco_points.csv`)
+or on the command line with `--point LAT,LON`.
+
 ```
-./corona_fetch.py --point 37.2343,-115.8067 --dry-run          # list covering frames only
-./corona_fetch.py --point 37.2343,-115.8067                    # download + 1 km crop
-./corona_fetch.py --points-file sites.csv --max-scenes 2       # CSV: name,lat,lon
-./corona_fetch.py --point LAT,LON --orientation all --margin-m 500 --rectify
+# 1. See what exists for the 1970s; downloads nothing, writes <out>/summary.json
+./corona_fetch.py --points-file examples/morocco_points.csv \
+    --start 1970-01-01 --end 1979-12-31 --dry-run --out declass_morocco
+
+# 2. Download and cut out the best frame per point
+./corona_fetch.py --points-file examples/morocco_points.csv \
+    --start 1970-01-01 --end 1979-12-31 --out declass_morocco
+
+# Useful options
+#   --max-scenes 2           frames per point (default 1)
+#   --dataset corona2        CORONA only; or "corona2,declassiii" to prefer CORONA
+#   --orientation all        write every plausible film orientation
+#   --rectify                resample the window north-up instead of a raw film cut-out
+#   --margin-m 2000          override the per-camera error margin
 ```
 
-Outputs per point (in `corona_output/<name>/`): an approximately georeferenced
-GeoTIFF (WGS84), a PNG preview, a ~10 km `_context.png` with the target box drawn,
-and a JSON sidecar. Full scans are cached in `corona_output/_scenes/` (0.5-2 GB each;
-`--delete-scenes` removes them after cropping).
+Ranking: downloadable frames first, then by dataset order, then ARGON last,
+then newest (`--sort oldest` to reverse). Frames USGS has not scanned yet are
+listed in `summary.json` with `downloadAvailable: false`; order them in
+EarthExplorer and rerun once they are scanned.
 
-## Caveats
+## Outputs
 
-- CORONA scans are not georeferenced. The crop is located with a homography fitted
-  to the four footprint corners in the USGS metadata; panoramic distortion means it
-  can be off by hundreds of metres. Use `--margin-m` and check the context preview.
-- The scan includes film border, a data strip and a USGS banner around the photo.
-  The photo frame is detected automatically and the footprint corners are mapped
-  onto it, not onto the whole scan.
-- The metadata does not say how the film is rotated/mirrored relative to north.
-  `--orientation auto` correlates the scan with USGS's georeferenced browse overlay
-  and picks the matching orientation; if the overlay is unavailable or the match is
-  ambiguous it falls back to north-up and logs a warning. `--orientation all` writes
-  every plausible orientation (best match first; scores are in the JSON sidecar).
-- Frames not yet scanned by USGS have no downloadable product; they are skipped
-  (order them through EarthExplorer).
+Per point, in `<out>/<name>/`:
+
+- `<name>_<frame>.tif`: the window as a GeoTIFF (WGS84, approximate affine
+  georeferencing), full scan resolution
+- `<name>_<frame>.png`: preview (max 4000 px)
+- `<name>_<frame>_context.png`: ~30 km around the point with the window outlined
+  in red and a north arrow in blue, in the film's own orientation
+- `<name>_<frame>.json`: frame metadata, camera, orientation and how it was
+  chosen (`usgs-overlay`, `camera-default` or `unverified`), pixel window,
+  ground sample distance
+
+`<out>/summary.json` lists every candidate frame per point and every crop made.
+
+## Accuracy: read this before using the crops
+
+The scans carry no georeferencing. The only geolocation USGS supplies is the
+four corners of each frame's footprint, and the script maps a point onto the
+film from those corners plus a panoramic camera model. Measured on real scans:
+
+| Camera | Measured placement error | Default margin each side |
+|---|---|---|
+| ARGON | not measured (frame camera, ~30 m pixels) | 1 km |
+| KH-4 (CORONA) | 1-5 km (Pentagon, two frames) | 5 km |
+| KH-9 (HEXAGON) | ~7-10 km near the strip end (Ouarzazate) | 10 km |
+
+So the window is a 1 km box plus the margin: the target is inside it, **not at
+its centre**. Find the exact spot in the preview by eye, or co-register the
+GeoTIFF against modern imagery downstream. USGS's own browse overlays share
+the same corner errors, so they cannot be used to tighten this.
+
+Film orientation (which way is north) is not in the metadata either:
+
+| Camera | Orientation used | Verified on |
+|---|---|---|
+| ARGON | TL=SE (180 deg) | DS09066A063MC071 vs USGS overlay (r = 0.74) |
+| KH-4 forward | TL=NW (north-up) | Pentagon in DS1101-2157DF028 |
+| KH-4 aft | TL=SE (180 deg) | Pentagon in DS1043-2157DA014 |
+| KH-9 aft | TL=SE (180 deg) | El Mansour Eddahbi reservoir in D3C1212-100087A023 |
+| KH-9 forward | **unknown**: all candidates are written | none yet |
+
+If the overlay match is conclusive it overrides these defaults. Check the north
+arrow in the context preview.
+
+Other things the script handles: multi-part scans are joined in the order that
+leaves no title-block gaps (KH-4 parts run `_d.._a` along the strip, KH-9 parts
+`_a.._g`), and the photo frame is detected inside the film border.
+
+## Morocco coverage (1970s, example points)
+
+From a dry run on 2026-10-27 (`examples/morocco_points.csv`):
+
+| Point | 1970s frames | Downloadable | First pick |
+|---|---|---|---|
+| Tangier | 14 | 5 | KH-9 aft, 1972-07-12 |
+| Rabat | 24 | 6 | KH-9 aft, 1979-05-13 |
+| Casablanca | 8 | 0 | - |
+| Fes | 16 | 3 | KH-4 aft, 1972-05-26 |
+| Oujda | 12 | 0 | - |
+| Marrakech | 9 | 4 | KH-9 aft, 1976-07-19 |
+| Errachidia | 14 | 2 | KH-9 aft, 1976-01-24 |
+| Ouarzazate | 13 | 7 | KH-9 aft, 1976-07-19 |
+| Agadir | 5 | 3 | KH-9 aft, 1974-01-14 |
+| Guelmim | 18 | 1 | KH-9 aft, 1974-01-14 |
+| Laayoune | 21 | 0 | - |
+| Dakhla | 8 | 0 | - |
+
+Where nothing is downloadable, the frames exist but must be ordered for scanning
+in EarthExplorer, or use Landsat MSS (60 m, `landsat_mss_c2_l1`, not handled by
+this script).
 
 ## Tests
 
 ```
 pip install pytest
-python3 -m pytest -q tests                      # unit tests (geometry, parsing, TIFF reading)
+python3 -m pytest -q tests                      # offline unit tests
 M2M_USERNAME=... M2M_TOKEN=... python3 -m pytest -q tests/test_live.py -s   # live search
 CORONA_LIVE_DOWNLOAD=1 ... python3 -m pytest -q tests/test_live.py -s       # live download + crop
 ```
 
-The live tests call the real USGS M2M API and are skipped when no credentials are set.
+The live tests call the real USGS M2M API and are skipped without credentials.
