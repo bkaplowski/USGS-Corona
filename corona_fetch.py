@@ -72,6 +72,10 @@ log = logging.getLogger("corona_fetch")
 
 API_URL = "https://m2m.cr.usgs.gov/api/api/json/stable/"
 DEFAULT_DATASET = "corona2"
+# Searched in this order of preference: KH-9 HEXAGON panoramic (Declass 3,
+# 0.6-1.2 m, 1971-84), then CORONA/ARGON (Declass 1, 1960-72).
+DEFAULT_DATASETS = "declassiii,corona2"
+WMS_URL = "https://ims.cr.usgs.gov/wms.py"
 EARTH_RADIUS_M = 6371008.8
 CORNERS = ("NW", "NE", "SE", "SW")
 TIFF_SUFFIXES = (".tif", ".tiff", ".ntf")
@@ -158,6 +162,148 @@ def point_in_polygon(x: float, y: float, poly: np.ndarray) -> bool:
 
 # Image corners in cyclic order: top-left, top-right, bottom-right, bottom-left.
 IMAGE_CORNER_NAMES = ("TL", "TR", "BR", "BL")
+NORM_CORNERS = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=float)
+
+
+@dataclass(frozen=True)
+class Camera:
+    """What we know about the camera behind a frame.
+
+    pan_deg: half scan angle of a panoramic camera (0 for frame cameras).
+    orientation: how the scan sits relative to the footprint corners when the
+        USGS overlay cannot tell us; None if not yet verified for this camera.
+    margin_m: typical error of the corner-based geolocation, used as the
+        default crop margin.
+    """
+
+    name: str
+    pan_deg: float = 0.0
+    orientation: str | None = None
+    margin_m: float = 1000.0
+
+
+# Orientations verified on real scans: ARGON against the USGS overlay
+# (DS09066A063MC071, r=0.74); KH-4 forward/aft by locating the Pentagon in
+# DS1101-2157DF028 and DS1043-2157DA014, where the placement error was 1-5 km (hence the 5 km margin).
+CAMERAS = {
+    "argon": Camera("ARGON (KH-5) frame camera", 0.0, "TL=SE,TR=SW", 1000.0),
+    "kh4-F": Camera("KH-4 forward panoramic camera", 35.0, "TL=NW,TR=NE", 5000.0),
+    "kh4-A": Camera("KH-4 aft panoramic camera", 35.0, "TL=SE,TR=SW", 5000.0),
+    "kh9-F": Camera("KH-9 forward panoramic camera", 60.0, None, 3000.0),
+    "kh9-A": Camera("KH-9 aft panoramic camera", 60.0, None, 3000.0),
+    "unknown": Camera("unknown camera", 0.0, None, 1000.0),
+}
+
+
+def camera_of(scene: "Scene") -> Camera:
+    """KH-4 ids look like DS1101-2157DF028, HEXAGON like D3C1217-100011F024 (the
+    letter before the frame number is the camera), ARGON like DS09066A063MC071."""
+    d = scene.display_id
+    cam = str(scene.metadata.get("Camera Type") or scene.metadata.get("Camera") or "")[:1].upper()
+    if not cam and len(d) > 4:
+        cam = d[-4].upper()
+    if d.startswith("DS1") and cam in ("A", "F"):
+        return CAMERAS[f"kh4-{cam}"]
+    if d.startswith("D3C") and cam in ("A", "F"):
+        return CAMERAS[f"kh9-{cam}"]
+    if d.startswith("DS0") and d[-5:-3] == "MC":
+        return CAMERAS["argon"]
+    return CAMERAS["unknown"]
+
+
+@dataclass(frozen=True)
+class FilmModel:
+    """Scan pixels <-> normalised film coordinates in which the ground maps
+    (approximately) projectively.
+
+    For a frame camera that is just the frame rescaled to [-1, 1]. A panoramic
+    camera records scan angle theta linearly along the strip, while the ground
+    moves as tan(theta) along the strip and the across-strip scale grows as
+    1/cos(theta) (the "bow-tie" footprint). Undoing both lets a homography
+    fitted to the four footprint corners hold over the whole strip.
+
+    ``gaps`` are (start, end) pixel ranges along the strip that hold no
+    ground: the title block and film clips where USGS joined scan parts. They
+    are cut out, so the photo on either side is treated as continuous.
+    """
+
+    frame: tuple[int, int, int, int]
+    pan_deg: float = 0.0
+    gaps: tuple[tuple[int, int], ...] = ()
+
+    def _axes(self):
+        x0, y0, x1, y1 = self.frame
+        cut = sum(b - a for a, b in self.gaps)
+        if x1 - x0 >= y1 - y0:
+            hx, hy = (x1 - x0 - cut) / 2, (y1 - y0) / 2
+            return x0 + hx, y0 + hy, hx, hy, True
+        hx, hy = (x1 - x0) / 2, (y1 - y0 - cut) / 2
+        return x0 + hx, y0 + hy, hx, hy, False
+
+    def _cut(self, t):
+        """Strip pixel -> gap-free strip pixel (a point in a gap goes to its start)."""
+        t = np.asarray(t, dtype=float)
+        out = t.copy()
+        for a, b in self.gaps:
+            out = out - np.clip(t - a, 0, b - a)
+        return out
+
+    def _uncut(self, t):
+        out = np.array(t, dtype=float)
+        for a, b in sorted(self.gaps):
+            out = np.where(out >= a, out + (b - a), out)
+        return out
+
+    def in_gap(self, u, v):
+        t = np.asarray(u if self._axes()[4] else v, dtype=float)
+        hit = np.zeros(t.shape, dtype=bool)
+        for a, b in self.gaps:
+            hit |= (t >= a) & (t < b)
+        return hit
+
+    def to_norm(self, u, v):
+        cx, cy, hx, hy, along_x = self._axes()
+        if along_x:
+            u = self._cut(u)
+        else:
+            v = self._cut(v)
+        a = (np.asarray(u, dtype=float) - cx) / hx
+        b = (np.asarray(v, dtype=float) - cy) / hy
+        if self.pan_deg > 0:
+            m = math.radians(self.pan_deg)
+            t, c = (a, b) if along_x else (b, a)
+            th = np.clip(t * m, -1.5, 1.5)
+            t, c = np.tan(th) / math.tan(m), c * math.cos(m) / np.cos(th)
+            a, b = (t, c) if along_x else (c, t)
+        return a, b
+
+    def from_norm(self, a, b):
+        cx, cy, hx, hy, along_x = self._axes()
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        if self.pan_deg > 0:
+            m = math.radians(self.pan_deg)
+            t, c = (a, b) if along_x else (b, a)
+            th = np.arctan(t * math.tan(m))
+            t, c = th / m, c * np.cos(th) / math.cos(m)
+            a, b = (t, c) if along_x else (c, t)
+        u, v = cx + a * hx, cy + b * hy
+        return (self._uncut(u), v) if along_x else (u, self._uncut(v))
+
+
+class GroundToScan:
+    """Local ground metres <-> scan pixels for one orientation."""
+
+    def __init__(self, ground_xy: np.ndarray, perm, film: FilmModel):
+        self.film = film
+        self.H = fit_homography(ground_xy[perm], NORM_CORNERS)
+        self.Hinv = np.linalg.inv(self.H)
+
+    def to_px(self, x, y):
+        return self.film.from_norm(*apply_homography(self.H, x, y))
+
+    def to_ground(self, u, v):
+        return apply_homography(self.Hinv, *self.film.to_norm(u, v))
 
 
 def orientation_candidates(ground_xy: np.ndarray, width: int, height: int):
@@ -247,6 +393,10 @@ class Scene:
     corners: dict[str, tuple[float, float]]  # corner -> (lat, lon)
     metadata: dict[str, str] = field(default_factory=dict)
     browse_url: str | None = None
+    dataset: str = ""
+    # CORONA frames whose WMS overlays stand in as a georeferenced reference
+    # when the scene has no overlay of its own (HEXAGON).
+    reference_layers: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -726,6 +876,35 @@ def _erode(mask: np.ndarray, r: int) -> np.ndarray:
     return out
 
 
+def _runs(flags: np.ndarray, min_frac: float = 0.02) -> list[tuple[int, int]]:
+    """[start, end) index ranges of True runs at least min_frac of the length."""
+    runs, start = [], None
+    for i, v in enumerate(np.append(flags, False)):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= min_frac * len(flags):
+                runs.append((start, i))
+            start = None
+    return runs
+
+
+def detect_gaps(mosaic: StripMosaic, frame: tuple[int, int, int, int]) -> tuple[tuple[int, int], ...]:
+    """Non-photo ranges along a panoramic strip (where scan parts were joined)."""
+    x0, y0, x1, y1 = frame
+    along_x = x1 - x0 >= y1 - y0
+    if max(x1 - x0, y1 - y0) < 3 * min(x1 - x0, y1 - y0):
+        return ()
+    a, step = mosaic.overview()
+    band = a[y0 // step : y1 // step, x0 // step : x1 // step]
+    lo, hi = np.percentile(band, [1, 99])
+    lit = band > lo + 0.06 * max(hi - lo, 1.0)
+    runs = _runs(lit.mean(axis=0 if along_x else 1) > 0.5)
+    origin = x0 if along_x else y0
+    return tuple((origin + runs[i][1] * step, origin + runs[i + 1][0] * step)
+                 for i in range(len(runs) - 1))
+
+
 def detect_frame(mosaic: StripMosaic, cells: int = 400) -> tuple[int, int, int, int] | None:
     """Find the exposed image area inside a film scan.
 
@@ -754,10 +933,42 @@ def detect_frame(mosaic: StripMosaic, cells: int = 400) -> tuple[int, int, int, 
     ys, xs = np.nonzero(core)
     y0, y1 = ys.min(), ys.max() + 1
     x0, x1 = xs.min(), xs.max() + 1
+    if max(h, w) > 3 * min(h, w):
+        # Panoramic strip: a scan comes in parts, each with its own clips and
+        # title block, which cut the photo into pieces along the strip. Span
+        # every substantial piece that lies in the photo's cross-strip band.
+        along_x = w >= h
+        band = lit[y0:y1, :] if along_x else lit[:, x0:x1]
+        runs = _runs(band.mean(axis=0 if along_x else 1) > 0.5)
+        if runs:
+            if along_x:
+                x0, x1 = min(x0, runs[0][0]), max(x1, runs[-1][1])
+            else:
+                y0, y1 = min(y0, runs[0][0]), max(y1, runs[-1][1])
     if (y1 - y0) * (x1 - x0) < 0.25 * h * w:
         return None
     s = b * step
     return (int(x0 * s), int(y0 * s), int(min(x1 * s, mosaic.width)), int(min(y1 * s, mosaic.height)))
+
+
+def assemble_scan(paths: list[Path]) -> StripMosaic:
+    """Join the TIFF parts of a scan in the order that makes one continuous photo.
+
+    USGS names the parts _a, _b, ...; on the KH-4 scans we checked, the parts run
+    in reverse order along the strip (_a holds the end with the title block).
+    Joined in the wrong order, the title block and film clips land inside the
+    photo, so we keep the order that leaves no such gaps (reverse on a tie).
+    """
+    if len(paths) < 2:
+        return StripMosaic(paths)
+    best = None
+    for order in (paths[::-1], paths):
+        m = StripMosaic(order)
+        frame = detect_frame(m)
+        n_gaps = len(detect_gaps(m, frame)) if frame else 99
+        if best is None or n_gaps < best[0]:
+            best = (n_gaps, m)
+    return best[1]
 
 
 def write_geotiff(path: Path, data: np.ndarray, geo_affine: np.ndarray | None) -> None:
@@ -799,15 +1010,42 @@ def to_preview(data: np.ndarray) -> Image.Image:
 # --------------------------------------------------------------------------- #
 
 
+def _has_wms_overlay(scene: Scene) -> bool:
+    return any("wms" in str(b.get("overlayType", "")).lower() and b.get("overlayPath")
+               for b in scene.raw.get("browse") or [])
+
+
+def pick_reference_layers(scene: Scene, others: list[Scene], max_layers: int = 12) -> list[str]:
+    """CORONA frames that together cover the scene's centre line, greedily."""
+    c = scene.corners
+    mid_a = [(c["NW"][i] + c["SW"][i]) / 2 for i in (0, 1)]
+    mid_b = [(c["NE"][i] + c["SE"][i]) / 2 for i in (0, 1)]
+    samples = [(mid_a[0] + t * (mid_b[0] - mid_a[0]), mid_a[1] + t * (mid_b[1] - mid_a[1]))
+               for t in np.linspace(0, 1, 24)]
+    cover = {o.entity_id: {i for i, (la, lo) in enumerate(samples) if o.contains(la, lo)}
+             for o in others if o.display_id.startswith("DS1")}
+    chosen, done = [], set()
+    while len(chosen) < max_layers:
+        ent = max(cover, key=lambda k: len(cover[k] - done), default=None)
+        if ent is None or not cover[ent] - done:
+            break
+        chosen.append(ent)
+        done |= cover.pop(ent)
+    return chosen
+
+
 def fetch_overlay(scene: Scene, long_side: int = 800, timeout: float = 60.0):
-    """USGS's own georeferenced rendering of the scene's browse image.
+    """USGS's own georeferenced rendering of the scene's browse image, or of
+    the overlapping CORONA frames in ``scene.reference_layers``.
 
     Returns (grey array, valid mask, lat grid, lon grid) on a plain lat/lon
-    grid covering the footprint, or None if the scene has no WMS overlay or the
-    server cannot be reached.
+    grid covering the footprint, or None if there is no overlay or the server
+    cannot be reached.
     """
     url = next((b.get("overlayPath") for b in scene.raw.get("browse") or []
                 if b.get("overlayPath") and "wms" in str(b.get("overlayType", "")).lower()), None)
+    if not url and scene.reference_layers:
+        url = f"{WMS_URL}?map=declassi&layers={','.join(scene.reference_layers)}"
     if not url:
         return None
     lats = [c[0] for c in scene.corners.values()]
@@ -840,8 +1078,22 @@ def fetch_overlay(scene: Scene, long_side: int = 800, timeout: float = 60.0):
     return grey, valid, lat_g, lon_g
 
 
-def match_orientation(scene: Scene, mosaic: StripMosaic, frame, cands, proj: LocalProjection,
-                      ground: np.ndarray, overlay=None) -> tuple[str | None, dict[str, float]]:
+def _box_blur(a: np.ndarray, k: int) -> np.ndarray:
+    if k <= 1:
+        return a
+    c = np.pad(a, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    h, w = a.shape
+    y0 = np.clip(np.arange(h) - k // 2, 0, h)
+    y1 = np.clip(np.arange(h) + (k + 1) // 2, 0, h)
+    x0 = np.clip(np.arange(w) - k // 2, 0, w)
+    x1 = np.clip(np.arange(w) + (k + 1) // 2, 0, w)
+    total = c[y1][:, x1] - c[y0][:, x1] - c[y1][:, x0] + c[y0][:, x0]
+    return total / ((y1 - y0)[:, None] * (x1 - x0)[None, :])
+
+
+def match_orientation(scene: Scene, mosaic: StripMosaic, film: FilmModel, cands,
+                      proj: LocalProjection, ground: np.ndarray,
+                      overlay=None) -> tuple[str | None, dict[str, float]]:
     """Score each candidate orientation by correlating the scan with USGS's
     georeferenced browse overlay. Returns (winner or None, scores)."""
     overlay = overlay if overlay is not None else fetch_overlay(scene)
@@ -849,13 +1101,18 @@ def match_orientation(scene: Scene, mosaic: StripMosaic, frame, cands, proj: Loc
         return None, {}
     grey, valid, lat_g, lon_g = overlay
     ov, step = mosaic.overview()
-    fx0, fy0, fx1, fy1 = frame
-    corners = np.array([[fx0, fy0], [fx1, fy0], [fx1, fy1], [fx0, fy1]], dtype=float)
+    fx0, fy0, fx1, fy1 = film.frame
     gx, gy = proj.forward(lat_g, lon_g)
+    # Average the scan down to the overlay's pixel size before sampling it, or
+    # field-scale texture aliases into noise.
+    overlay_m = float(np.hypot(gx[0, 1] - gx[0, 0], gy[0, 1] - gy[0, 0]))
+    edges = np.linalg.norm(ground - np.roll(ground, -1, axis=0), axis=1)
+    scan_m = max(edges) / max(fx1 - fx0, fy1 - fy0)
+    ov = _box_blur(ov, int(round(overlay_m / (scan_m * step))))
     scores = {}
     for name, perm in cands:
-        u, v = apply_homography(fit_homography(ground[perm], corners), gx, gy)
-        ok = valid & (u >= fx0) & (u < fx1) & (v >= fy0) & (v < fy1)
+        u, v = GroundToScan(ground, perm, film).to_px(gx, gy)
+        ok = valid & (u >= fx0) & (u < fx1) & (v >= fy0) & (v < fy1) & ~film.in_gap(u, v)
         if ok.sum() < 100:
             continue
         ui = np.clip((u[ok] / step).astype(int), 0, ov.shape[1] - 1)
@@ -898,7 +1155,9 @@ def crop_scene(
     orientation: str = "auto",
     rectify: bool = False,
     context_m: float = 10000.0,
+    pan_deg: float | None = None,
 ) -> list[CropResult]:
+    camera = camera_of(scene)
     proj = LocalProjection(lat, lon)
     ground = scene.ground_xy(proj)
     frame = detect_frame(mosaic)
@@ -910,21 +1169,33 @@ def crop_scene(
         log.info("[%s] image frame x=%d..%d y=%d..%d of %dx%d scan", scene.display_id,
                  frame[0], frame[2], frame[1], frame[3], mosaic.width, mosaic.height)
     fx0, fy0, fx1, fy1 = frame
-    image_corners = np.array([[fx0, fy0], [fx1, fy0], [fx1, fy1], [fx0, fy1]], dtype=float)
+    gaps = detect_gaps(mosaic, frame)
+    if gaps:
+        log.info("[%s] cutting %d non-photo gap(s) between scan parts: %s", scene.display_id,
+                 len(gaps), gaps)
+    film = FilmModel(frame, camera.pan_deg if pan_deg is None else pan_deg, gaps)
     cands = orientation_candidates(ground, fx1 - fx0, fy1 - fy0)
     source, scores = "user", {}
     if orientation in ("auto", "all"):
-        best, scores = match_orientation(scene, mosaic, frame, cands, proj, ground)
+        best, scores = match_orientation(scene, mosaic, film, cands, proj, ground)
+        if best:
+            source = "usgs-overlay"
+        elif camera.orientation and any(c[0] == camera.orientation for c in cands):
+            best, source = camera.orientation, "camera-default"
+        else:
+            source = "unverified"
         if best:
             cands.sort(key=lambda c: c[0] != best)
-        source = "usgs-overlay" if best else "default"
     if orientation == "all":
         chosen = cands
     elif orientation == "auto":
         chosen = cands[:1]
-        if source == "default":
-            log.warning("[%s] orientation unverified; assuming %s (try --orientation all)",
-                        scene.display_id, chosen[0][0])
+        if source == "unverified":
+            log.warning("[%s] orientation unverified for %s; assuming %s (check the context "
+                        "preview, or use --orientation all)", scene.display_id, camera.name,
+                        chosen[0][0])
+        else:
+            log.info("[%s] orientation %s (%s)", scene.display_id, chosen[0][0], source)
     else:
         chosen = [c for c in cands if c[0].replace(" ", "").upper() == orientation.replace(" ", "").upper()]
         if not chosen:
@@ -934,8 +1205,8 @@ def crop_scene(
     box = np.array([[-half, half], [half, half], [half, -half], [-half, -half]])
     results = []
     for name, perm in chosen:
-        H = fit_homography(ground[perm], image_corners)
-        u, v = apply_homography(H, box[:, 0], box[:, 1])
+        g2s = GroundToScan(ground, perm, film)
+        u, v = g2s.to_px(box[:, 0], box[:, 1])
         x0, x1 = int(math.floor(u.min())), int(math.ceil(u.max()))
         y0, y1 = int(math.floor(v.min())), int(math.ceil(v.max()))
         if x1 <= 0 or y1 <= 0 or x0 >= mosaic.width or y0 >= mosaic.height:
@@ -946,23 +1217,22 @@ def crop_scene(
         if (x0c, y0c, x1c, y1c) != (x0, y0, x1, y1):
             log.warning("[%s] window is clipped by the edge of the scan", scene.display_id)
 
-        # Ground sample distance at the target from the homography Jacobian.
+        # Ground sample distance at the target from the mapping's Jacobian.
         eps = 1.0
-        u0, v0 = apply_homography(H, 0.0, 0.0)
-        ux, vx = apply_homography(H, eps, 0.0)
-        uy, vy = apply_homography(H, 0.0, eps)
+        u0, v0 = g2s.to_px(0.0, 0.0)
+        ux, vx = g2s.to_px(eps, 0.0)
+        uy, vy = g2s.to_px(0.0, eps)
         det = abs((ux - u0) * (vy - v0) - (uy - u0) * (vx - v0))
         gsd = float(1.0 / math.sqrt(det)) if det > 0 else float("nan")
 
         tag = stem if len(chosen) == 1 else f"{stem}_{name.replace('=', '').replace(',', '_')}"
         files = {}
-        Hinv = np.linalg.inv(H)
         if rectify:
             n = max(2, min(8000, int(round(2 * half / gsd))))
             gx = np.linspace(-half, half, n)
             gy = np.linspace(half, -half, n)
             GX, GY = np.meshgrid(gx, gy)
-            uu, vv = apply_homography(H, GX, GY)
+            uu, vv = g2s.to_px(GX, GY)
             raw = mosaic.read(x0c, y0c, x1c + 2, y1c + 2)
             data = _bilinear(raw, uu - x0c, vv - y0c)
             pixel_size = 2 * half / (n - 1)
@@ -976,7 +1246,7 @@ def crop_scene(
             # Fit a pixel->lon/lat affine over the crop for the GeoTIFF tags.
             cols = np.array([0, x1c - x0c, 0, x1c - x0c], dtype=float)
             rows = np.array([0, 0, y1c - y0c, y1c - y0c], dtype=float)
-            mx, my = apply_homography(Hinv, cols + x0c, rows + y0c)
+            mx, my = g2s.to_ground(cols + x0c, rows + y0c)
         glat, glon = proj.inverse(mx, my)
         A = np.column_stack([cols, rows, np.ones_like(cols, dtype=float)])
         coef_lon, *_ = np.linalg.lstsq(A, glon, rcond=None)
@@ -994,7 +1264,7 @@ def crop_scene(
         if context_m and context_m > 2 * half:
             ch = context_m / 2
             cbox = np.array([[-ch, ch], [ch, ch], [ch, -ch], [-ch, -ch]])
-            cu, cv = apply_homography(H, cbox[:, 0], cbox[:, 1])
+            cu, cv = g2s.to_px(cbox[:, 0], cbox[:, 1])
             cx0, cx1 = max(int(cu.min()), 0), min(int(cu.max()), mosaic.width)
             cy0, cy1 = max(int(cv.min()), 0), min(int(cv.max()), mosaic.height)
             if cx1 > cx0 and cy1 > cy0:
@@ -1003,7 +1273,7 @@ def crop_scene(
                 d = ImageDraw.Draw(ctx)
                 tb = [((ui - cx0) / step, (vi - cy0) / step) for ui, vi in zip(u, v)]
                 d.polygon(tb, outline=(255, 40, 40), width=3)
-                nu, nv = apply_homography(H, [0, 0], [0, 0.6 * ch])
+                nu, nv = g2s.to_px([0, 0], [0, 0.6 * ch])
                 d.line([((nu[0] - cx0) / step, (nv[0] - cy0) / step),
                         ((nu[1] - cx0) / step, (nv[1] - cy0) / step)], fill=(40, 200, 255), width=3)
                 d.text(((nu[1] - cx0) / step + 4, (nv[1] - cy0) / step), "N", fill=(40, 200, 255))
@@ -1106,11 +1376,14 @@ def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "point"
 
 
-def rank_scenes(scenes: list[Scene], sort: str) -> list[Scene]:
-    """Frames flagged downloadable first, then unknown, then not; by date within each."""
+def rank_scenes(scenes: list[Scene], sort: str, datasets: list[str] | None = None) -> list[Scene]:
+    """Frames flagged downloadable first, then unknown, then not; within each,
+    by dataset preference, then coarse ARGON frames last, then by date."""
     by_date = sorted(scenes, key=lambda s: s.acquired, reverse=(sort == "newest"))
     tier = {True: 0, None: 1, False: 2}
-    return sorted(by_date, key=lambda s: tier[s.download_available()])
+    pref = {d: i for i, d in enumerate(datasets or [])}
+    return sorted(by_date, key=lambda s: (tier[s.download_available()], pref.get(s.dataset, 0),
+                                          camera_of(s) is CAMERAS["argon"]))
 
 
 def run(args) -> int:
@@ -1128,38 +1401,45 @@ def run(args) -> int:
             raise SystemExit("set M2M_TOKEN to your ERS application token")
         token = getpass.getpass(f"M2M application token for {username}: ")
 
+    datasets = [d.strip() for d in args.dataset.split(",") if d.strip()]
     summary = []
     with M2MClient(args.api_url) as api:
         api.login(username, token)
         log.info("logged in to M2M as %s", username)
         for p in points:
             bbox = box_around(p.lat, p.lon, args.size_m)
-            log.info("== %s (%.5f, %.5f): searching %s", p.name, p.lat, p.lon, args.dataset)
-            results = api.scene_search(args.dataset, bbox, args.start, args.end, args.max_search)
-            scenes = [s for s in (scene_from_result(r) for r in results) if s]
-            scenes = [s for s in scenes if s.contains(p.lat, p.lon)]
-            scenes = rank_scenes(scenes, args.sort)
+            scenes = []
+            for ds in datasets:
+                log.info("== %s (%.5f, %.5f): searching %s", p.name, p.lat, p.lon, ds)
+                for s in (scene_from_result(r) for r in
+                          api.scene_search(ds, bbox, args.start, args.end, args.max_search)):
+                    if s and s.contains(p.lat, p.lon):
+                        s.dataset = ds
+                        scenes.append(s)
+            scenes = rank_scenes(scenes, args.sort, datasets)
             log.info("   %d frame(s) cover the point", len(scenes))
             entry = {"point": p.__dict__, "candidates": [], "crops": []}
             summary.append(entry)
             for s in scenes:
                 entry["candidates"].append(
-                    {"entityId": s.entity_id, "displayId": s.display_id, "acquired": s.acquired,
+                    {"dataset": s.dataset, "entityId": s.entity_id, "displayId": s.display_id,
+                     "acquired": s.acquired, "camera": camera_of(s).name,
                      "downloadAvailable": s.download_available(),
-                     "camera": s.metadata.get("Camera Type") or s.metadata.get("Camera"),
                      "mission": s.metadata.get("Mission")}
                 )
-                log.info("   %s  %s  available=%s", s.display_id, s.acquired, s.download_available())
+                log.info("   %-20s %s  %-30s available=%s", s.display_id, s.acquired,
+                         camera_of(s).name, s.download_available())
             if args.dry_run or not scenes:
                 continue
 
             # Ask for download options for the top candidates; skip unscanned frames.
             selected: list[tuple[Scene, dict]] = []
             pool = scenes[: max(args.max_scenes * 5, 10)]
-            opts = api.download_options(args.dataset, [s.entity_id for s in pool])
             by_entity: dict[str, list[dict]] = {}
-            for o in opts:
-                by_entity.setdefault(str(o.get("entityId")), []).append(o)
+            for ds in datasets:
+                ids = [s.entity_id for s in pool if s.dataset == ds]
+                for o in api.download_options(ds, ids) if ids else []:
+                    by_entity.setdefault(str(o.get("entityId")), []).append(o)
             for s in pool:
                 prod = pick_product(by_entity.get(s.entity_id, []), args.product)
                 if prod is None:
@@ -1189,6 +1469,16 @@ def run(args) -> int:
             point_dir = out_root / _slug(p.name)
             point_dir.mkdir(parents=True, exist_ok=True)
             for s, prod in selected:
+                if not _has_wms_overlay(s) and args.orientation in ("auto", "all"):
+                    lats = [c[0] for c in s.corners.values()]
+                    lons = [c[1] for c in s.corners.values()]
+                    try:
+                        found = api.scene_search(DEFAULT_DATASET, (min(lats), min(lons), max(lats), max(lons)),
+                                                 max_results=300)
+                        others = [o for o in (scene_from_result(r) for r in found) if o]
+                        s.reference_layers = pick_reference_layers(s, others)
+                    except M2MError as e:
+                        log.info("   %s: no CORONA reference for the orientation check: %s", s.display_id, e)
                 scene_dir = raw_root / s.entity_id
                 tiffs = _cached_tiffs(scene_dir)
                 if not tiffs:
@@ -1201,11 +1491,13 @@ def run(args) -> int:
                     if not args.keep_archives and archive.suffix.lower() not in TIFF_SUFFIXES:
                         archive.unlink()
                 log.info("   %s: %d TIFF part(s)", s.display_id, len(tiffs))
-                mosaic = StripMosaic(tiffs)
+                mosaic = assemble_scan(tiffs)
                 stem = f"{_slug(p.name)}_{_slug(s.display_id)}"
+                margin = camera_of(s).margin_m if args.margin_m is None else args.margin_m
                 crops = crop_scene(
-                    s, mosaic, p.lat, p.lon, args.size_m, args.margin_m, point_dir, stem,
+                    s, mosaic, p.lat, p.lon, args.size_m, margin, point_dir, stem,
                     orientation=args.orientation, rectify=args.rectify, context_m=args.context_m,
+                    pan_deg=args.pan_angle,
                 )
                 if s.browse_url and args.browse:
                     try:
@@ -1216,14 +1508,16 @@ def run(args) -> int:
                 meta = {
                     "point": p.__dict__,
                     "size_m": args.size_m,
-                    "margin_m": args.margin_m,
-                    "scene": {"entityId": s.entity_id, "displayId": s.display_id,
+                    "margin_m": margin,
+                    "camera": camera_of(s).__dict__,
+                    "scene": {"dataset": s.dataset, "entityId": s.entity_id, "displayId": s.display_id,
                               "acquired": s.acquired, "corners": s.corners, "metadata": s.metadata},
                     "product": {k: prod.get(k) for k in ("id", "productName", "filesize")},
                     "source_tiffs": [str(t) for t in tiffs],
                     "mosaic_size_px": [mosaic.width, mosaic.height],
                     "crops": [c.__dict__ for c in crops],
-                    "note": "Geolocation is approximate (homography from footprint corners).",
+                    "note": "Geolocation is approximate (footprint corners + film model); "
+                            "expect errors of about margin_m. Check the context preview.",
                 }
                 (point_dir / f"{stem}.json").write_text(json.dumps(meta, indent=2, default=str))
                 entry["crops"].extend(
@@ -1255,7 +1549,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--point", action="append", metavar="LAT,LON", help="target point (repeatable)")
     g.add_argument("--points-file", help="CSV of points: name,lat,lon (header optional)")
     g = p.add_argument_group("search")
-    g.add_argument("--dataset", default=DEFAULT_DATASET, help="M2M dataset name")
+    g.add_argument("--dataset", default=DEFAULT_DATASETS,
+                   help="M2M dataset(s), comma-separated in order of preference "
+                        "(declassiii = KH-9 HEXAGON, corona2 = CORONA/ARGON)")
     g.add_argument("--start", help="earliest acquisition date YYYY-MM-DD")
     g.add_argument("--end", help="latest acquisition date YYYY-MM-DD")
     g.add_argument("--sort", choices=("newest", "oldest"), default="newest",
@@ -1267,8 +1563,11 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("output")
     g.add_argument("--out", default="corona_output", help="output directory")
     g.add_argument("--size-m", type=float, default=1000.0, help="side of the square window, metres")
-    g.add_argument("--margin-m", type=float, default=0.0,
-                   help="extra margin on each side to absorb geolocation error, metres")
+    g.add_argument("--margin-m", type=float, default=None,
+                   help="extra margin on each side to absorb geolocation error, metres "
+                        "(default: per camera, 1 km for ARGON, 5 km for KH-4, 3 km for KH-9)")
+    g.add_argument("--pan-angle", type=float, default=None,
+                   help="override the panoramic half scan angle in degrees (0 = frame camera)")
     g.add_argument("--context-m", type=float, default=10000.0,
                    help="side of the context preview, metres (0 disables)")
     g.add_argument("--orientation", default="auto",

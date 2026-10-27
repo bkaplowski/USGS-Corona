@@ -178,5 +178,56 @@ def test_match_orientation_against_overlay(tmp_path):
     lon_g, lat_g = np.meshgrid(np.linspace(-115.9, -115.7, 400), np.linspace(37.3, 37.15, 300))
     overlay = (texture.astype(np.float32), np.ones(texture.shape, bool), lat_g, lon_g)
     cands = cf.orientation_candidates(ground, frame[2] - frame[0], frame[3] - frame[1])
-    best, scores = cf.match_orientation(scene, m, frame, cands, proj, ground, overlay)
+    best, scores = cf.match_orientation(scene, m, cf.FilmModel(frame), cands, proj, ground, overlay)
     assert best == "TL=SE,TR=SW", scores
+
+
+@pytest.mark.parametrize("pan", [0.0, 35.0, 60.0])
+def test_film_model_roundtrip_with_gaps(pan):
+    fm = cf.FilmModel((100, 50, 10100, 950), pan, ((3000, 3500), (7000, 7200)))
+    u = np.array([100, 2999, 3500, 5000, 6999, 7200, 10099.0])
+    v = np.array([50, 300, 500, 700, 949, 600, 400.0])
+    a, b = fm.to_norm(u, v)
+    assert a[0] == pytest.approx(-1) and a[-1] == pytest.approx(1, abs=1e-3)
+    assert a[1] == pytest.approx(a[2], abs=1e-3)  # a gap has no ground width
+    uu, vv = fm.from_norm(a, b)
+    np.testing.assert_allclose(uu, u, atol=1e-6)
+    np.testing.assert_allclose(vv, v, atol=1e-6)
+    assert fm.in_gap(np.array([3200.0, 2000.0]), np.array([0.0, 0.0])).tolist() == [True, False]
+
+
+def test_panoramic_model_compresses_strip_ends():
+    # Ground moves as tan(theta): equal steps on the ground take fewer film
+    # pixels near the ends of a panoramic strip than in the middle.
+    fm = cf.FilmModel((0, 0, 10000, 1000), 35.0)
+    u, _ = fm.from_norm(np.array([0.0, 0.1, 0.9, 1.0]), np.zeros(4))
+    assert (u[3] - u[2]) < 0.8 * (u[1] - u[0])
+
+
+@pytest.mark.parametrize("display_id,meta,key", [
+    ("DS1101-2157DF028", {"Camera Type": "Forward"}, "kh4-F"),
+    ("DS1043-2157DA014", {}, "kh4-A"),
+    ("D3C1217-100011F024", {"Camera": "F"}, "kh9-F"),
+    ("DS09066A063MC071", {}, "argon"),
+    ("XYZ", {}, "unknown"),
+])
+def test_camera_of(display_id, meta, key):
+    scene = cf.Scene("e", display_id, "", {}, metadata=meta)
+    assert cf.camera_of(scene) == cf.CAMERAS[key]
+
+
+def test_assemble_scan_puts_title_block_at_strip_end(tmp_path):
+    # Two parts of one strip. The title block (dark, with text) sits at the far
+    # end of part _a, i.e. at the end of the strip, so the right order is b, a.
+    rng = np.random.default_rng(3)
+    h = 200
+    a = rng.integers(60, 220, (h, 1000), dtype=np.uint8)
+    a[:, 850:] = 0  # title block / film end
+    a[90:110, 870:930] = 255  # title text
+    b = rng.integers(60, 220, (h, 1000), dtype=np.uint8)
+    paths = []
+    for name, arr in (("s_a.tif", a), ("s_b.tif", b)):
+        tifffile.imwrite(tmp_path / name, arr)
+        paths.append(tmp_path / name)
+    m = cf.assemble_scan(paths)
+    assert [p.name for p in m.paths] == ["s_b.tif", "s_a.tif"]
