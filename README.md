@@ -40,8 +40,9 @@ and a JSON sidecar. Full scans are cached in `corona_output/_scenes/` (0.5-2 GB 
 
 ```
 pip install pytest
-python3 -m pytest -q tests
+python3 -m pytest -q tests                      # unit tests (geometry, parsing, TIFF reading)
+M2M_USERNAME=... M2M_TOKEN=... python3 -m pytest -q tests/test_live.py -s   # live search
+CORONA_LIVE_DOWNLOAD=1 ... python3 -m pytest -q tests/test_live.py -s       # live download + crop
 ```
 
-The tests run against a local fake M2M server and synthetic scans; they have not
-yet been run against the live USGS API.
+The live tests call the real USGS M2M API and are skipped when no credentials are set.
