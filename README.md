@@ -30,9 +30,14 @@ and a JSON sidecar. Full scans are cached in `corona_output/_scenes/` (0.5-2 GB 
 - CORONA scans are not georeferenced. The crop is located with a homography fitted
   to the four footprint corners in the USGS metadata; panoramic distortion means it
   can be off by hundreds of metres. Use `--margin-m` and check the context preview.
+- The scan includes film border, a data strip and a USGS banner around the photo.
+  The photo frame is detected automatically and the footprint corners are mapped
+  onto it, not onto the whole scan.
 - The metadata does not say how the film is rotated/mirrored relative to north.
-  `--orientation auto` assumes north-up; `--orientation all` writes every plausible
-  orientation so you can pick the right one.
+  `--orientation auto` correlates the scan with USGS's georeferenced browse overlay
+  and picks the matching orientation; if the overlay is unavailable or the match is
+  ambiguous it falls back to north-up and logs a warning. `--orientation all` writes
+  every plausible orientation (best match first; scores are in the JSON sidecar).
 - Frames not yet scanned by USGS have no downloadable product; they are skipped
   (order them through EarthExplorer).
 

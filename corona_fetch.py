@@ -47,6 +47,8 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
+import html
+import io
 import json
 import logging
 import math
@@ -165,13 +167,15 @@ def orientation_candidates(ground_xy: np.ndarray, width: int, height: int):
     that cyclic order). The scan can be rotated and/or mirrored relative to
     north, which the metadata does not record. Of the 8 dihedral assignments
     of image corners to ground corners, we keep the 4 that put the image's long
-    axis on the footprint's long axis, ordered so the "north-up, unmirrored"
-    reading comes first.
+    axis on the footprint's long axis (all 8 when either is close to square,
+    e.g. ARGON frames), ordered so the "north-up, unmirrored" reading comes
+    first.
 
     Returns a list of (name, permutation) where permutation[i] is the index of
     the ground corner that sits at image corner i (TL, TR, BR, BL).
     """
     cands = []
+    image_aspect = max(width, height) / max(min(width, height), 1)
     for rot in range(4):
         for mirror in (False, True):
             if mirror:
@@ -182,9 +186,9 @@ def orientation_candidates(ground_xy: np.ndarray, width: int, height: int):
             g = ground_xy[perm]
             top = np.linalg.norm(g[1] - g[0]) + np.linalg.norm(g[2] - g[3])
             side = np.linalg.norm(g[3] - g[0]) + np.linalg.norm(g[2] - g[1])
-            image_wide = width >= height
-            ground_wide = top >= side
-            if image_wide != ground_wide:
+            ground_aspect = max(top, side) / max(min(top, side), 1e-9)
+            elongated = image_aspect > 1.5 and ground_aspect > 1.5
+            if elongated and (width >= height) != (top >= side):
                 continue
             name = f"TL={CORNERS[perm[0]]},TR={CORNERS[perm[1]]}"
             cands.append((name, perm, rot, mirror))
@@ -204,7 +208,7 @@ def parse_coordinate(value) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    s = str(value).strip()
+    s = html.unescape(str(value)).strip()  # USGS sends e.g. 37&deg;48'39.60"N
     if not s:
         return None
     try:
@@ -212,7 +216,7 @@ def parse_coordinate(value) -> float | None:
     except ValueError:
         pass
     hemi = 1.0
-    m = re.search(r"([NSEW])", s, re.I)
+    m = re.search(r"(?<![A-Za-z])([NSEW])(?![A-Za-z])", s, re.I)
     if m:
         if m.group(1).upper() in "SW":
             hemi = -1.0
@@ -267,8 +271,13 @@ class Scene:
 
     def download_available(self) -> bool | None:
         for k, v in self.metadata.items():
-            if "download available" in k.lower():
-                return str(v).strip().upper().startswith("Y")
+            if "downloadavailable" in k.lower().replace(" ", ""):  # "Down Load Available"
+                if isinstance(v, bool):
+                    return v
+                return str(v).strip().upper().startswith(("Y", "T"))
+        opts = self.raw.get("options") or {}
+        if isinstance(opts.get("download"), bool):
+            return opts["download"]
         return None
 
 
@@ -288,7 +297,8 @@ def _metadata_dict(result: dict) -> dict[str, str]:
 def _corners_from_metadata(md: dict[str, str]) -> dict[str, tuple[float, float]] | None:
     found: dict[str, dict[str, tuple[int, float]]] = {c: {} for c in CORNERS}
     for key, value in md.items():
-        m = re.match(r"^\s*(NW|NE|SE|SW)\s+Corner\s+(Lat|Long|Lon)\w*\s*(dec)?", key, re.I)
+        # "Cor[nm]er": USGS sends "NW Cormer Lat dec".
+        m = re.match(r"^\s*(NW|NE|SE|SW)\s+Cor[nm]er\s+(Lat|Long|Lon)\w*\s*(dec)?", key, re.I)
         if not m:
             continue
         corner = m.group(1).upper()
@@ -675,6 +685,80 @@ class StripMosaic:
             out[r0 : r0 + block.shape[0], c0 : c0 + block.shape[1]] = block
         return out
 
+    def overview(self, long_side: int = 3200) -> tuple[np.ndarray, int]:
+        """Decimated grey copy of the whole scan (cached) and its step."""
+        step = max(1, max(self.width, self.height) // long_side)
+        cache = self.__dict__.setdefault("_overviews", {})
+        if step not in cache:
+            a = self.read(0, 0, self.width, self.height, step=step).astype(np.float32)
+            cache[step] = a.mean(axis=2) if a.ndim == 3 else a
+        return cache[step], step
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    """Boolean mask of the largest 4-connected True region."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    best, best_size, n = 0, 0, 0
+    h, w = mask.shape
+    for sy, sx in zip(*np.nonzero(mask)):
+        if labels[sy, sx]:
+            continue
+        n += 1
+        labels[sy, sx] = n
+        stack, size = [(sy, sx)], 0
+        while stack:
+            y, x = stack.pop()
+            size += 1
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = n
+                    stack.append((ny, nx))
+        if size > best_size:
+            best, best_size = n, size
+    return labels == best if best else np.zeros_like(mask)
+
+
+def _erode(mask: np.ndarray, r: int) -> np.ndarray:
+    out = mask.copy()
+    for _ in range(r):
+        p = np.pad(out, 1, constant_values=False)
+        out = out & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:]
+    return out
+
+
+def detect_frame(mosaic: StripMosaic, cells: int = 400) -> tuple[int, int, int, int] | None:
+    """Find the exposed image area inside a film scan.
+
+    USGS scans include the black unexposed film border, a grey data strip, a
+    white leader and a USGS banner around the photo. The footprint corners refer
+    to the photo itself, so the homography must be fitted to its corners, not
+    the scan's. The photo is taken as the largest connected non-black region of
+    a block-averaged overview. Returns (x0, y0, x1, y1) in mosaic pixels, or
+    None when nothing plausible is found.
+    """
+    a, step = mosaic.overview(cells * 8)
+    b = max(1, int(math.ceil(max(a.shape) / cells)))
+    h, w = a.shape[0] // b, a.shape[1] // b
+    if h < 8 or w < 8:
+        return None
+    bm = a[: h * b, : w * b].reshape(h, b, w, b).mean(axis=(1, 3))
+    lo, hi = np.percentile(bm, [1, 99])
+    lit = bm > lo + 0.06 * max(hi - lo, 1.0)
+    core = _largest_component(_erode(lit, 2))
+    if not core.any():
+        return None
+    # Undo the erosion, but only into lit cells.
+    for _ in range(2):
+        p = np.pad(core, 1, constant_values=False)
+        core = lit & (core | p[:-2, 1:-1] | p[2:, 1:-1] | p[1:-1, :-2] | p[1:-1, 2:])
+    ys, xs = np.nonzero(core)
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+    if (y1 - y0) * (x1 - x0) < 0.25 * h * w:
+        return None
+    s = b * step
+    return (int(x0 * s), int(y0 * s), int(min(x1 * s, mosaic.width)), int(min(y1 * s, mosaic.height)))
+
 
 def write_geotiff(path: Path, data: np.ndarray, geo_affine: np.ndarray | None) -> None:
     """Write ``data`` as a TIFF; with ``geo_affine`` (2x3, pixel -> lon/lat) add
@@ -715,6 +799,80 @@ def to_preview(data: np.ndarray) -> Image.Image:
 # --------------------------------------------------------------------------- #
 
 
+def fetch_overlay(scene: Scene, long_side: int = 800, timeout: float = 60.0):
+    """USGS's own georeferenced rendering of the scene's browse image.
+
+    Returns (grey array, valid mask, lat grid, lon grid) on a plain lat/lon
+    grid covering the footprint, or None if the scene has no WMS overlay or the
+    server cannot be reached.
+    """
+    url = next((b.get("overlayPath") for b in scene.raw.get("browse") or []
+                if b.get("overlayPath") and "wms" in str(b.get("overlayType", "")).lower()), None)
+    if not url:
+        return None
+    lats = [c[0] for c in scene.corners.values()]
+    lons = [c[1] for c in scene.corners.values()]
+    s, n, w, e = min(lats), max(lats), min(lons), max(lons)
+    aspect = (e - w) * math.cos(math.radians((s + n) / 2)) / max(n - s, 1e-9)
+    width = int(long_side if aspect >= 1 else max(16, long_side * aspect))
+    height = int(long_side if aspect < 1 else max(16, long_side / aspect))
+    params = {"service": "WMS", "version": "1.1.1", "request": "GetMap", "srs": "EPSG:4326",
+              "bbox": f"{w},{s},{e},{n}", "width": width, "height": height,
+              "format": "image/png", "styles": "", "transparent": "true"}
+    base, _, query = url.partition("?")
+    for kv in query.split("&"):
+        k, _, v = kv.partition("=")
+        if k.lower() in ("map", "layers"):
+            params[k.lower()] = v
+    try:
+        r = requests.get(base, params=params, timeout=timeout)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+    except (requests.RequestException, OSError) as e:
+        log.info("[%s] no USGS overlay for orientation check: %s", scene.display_id, e)
+        return None
+    a = np.asarray(img, dtype=np.float32)
+    grey, valid = a[..., :3].mean(axis=2), a[..., 3] > 0
+    valid &= grey > 0
+    if valid.sum() < 100:
+        return None
+    lon_g, lat_g = np.meshgrid(np.linspace(w, e, width), np.linspace(n, s, height))
+    return grey, valid, lat_g, lon_g
+
+
+def match_orientation(scene: Scene, mosaic: StripMosaic, frame, cands, proj: LocalProjection,
+                      ground: np.ndarray, overlay=None) -> tuple[str | None, dict[str, float]]:
+    """Score each candidate orientation by correlating the scan with USGS's
+    georeferenced browse overlay. Returns (winner or None, scores)."""
+    overlay = overlay if overlay is not None else fetch_overlay(scene)
+    if overlay is None:
+        return None, {}
+    grey, valid, lat_g, lon_g = overlay
+    ov, step = mosaic.overview()
+    fx0, fy0, fx1, fy1 = frame
+    corners = np.array([[fx0, fy0], [fx1, fy0], [fx1, fy1], [fx0, fy1]], dtype=float)
+    gx, gy = proj.forward(lat_g, lon_g)
+    scores = {}
+    for name, perm in cands:
+        u, v = apply_homography(fit_homography(ground[perm], corners), gx, gy)
+        ok = valid & (u >= fx0) & (u < fx1) & (v >= fy0) & (v < fy1)
+        if ok.sum() < 100:
+            continue
+        ui = np.clip((u[ok] / step).astype(int), 0, ov.shape[1] - 1)
+        vi = np.clip((v[ok] / step).astype(int), 0, ov.shape[0] - 1)
+        c = np.corrcoef(ov[vi, ui], grey[ok])[0, 1]
+        scores[name] = float(c) if np.isfinite(c) else 0.0
+    ranked = sorted(scores.values(), reverse=True) + [0.0, 0.0]
+    best = max(scores, key=scores.get) if scores else None
+    if best is None or ranked[0] < 0.3 or ranked[0] - ranked[1] < 0.1:
+        log.info("[%s] overlay match inconclusive: %s", scene.display_id,
+                 {k: round(v, 2) for k, v in scores.items()})
+        return None, scores
+    log.info("[%s] orientation %s matches the USGS overlay (r=%.2f, next %.2f)",
+             scene.display_id, best, ranked[0], ranked[1])
+    return best, scores
+
+
 @dataclass
 class CropResult:
     orientation: str
@@ -723,6 +881,9 @@ class CropResult:
     files: dict[str, str]
     footprint_corner_lat_lon: dict[str, tuple[float, float]]
     rectified: bool
+    image_frame_px: tuple[int, int, int, int]
+    orientation_source: str
+    orientation_scores: dict[str, float]
 
 
 def crop_scene(
@@ -740,14 +901,30 @@ def crop_scene(
 ) -> list[CropResult]:
     proj = LocalProjection(lat, lon)
     ground = scene.ground_xy(proj)
-    image_corners = np.array(
-        [[0, 0], [mosaic.width, 0], [mosaic.width, mosaic.height], [0, mosaic.height]], dtype=float
-    )
-    cands = orientation_candidates(ground, mosaic.width, mosaic.height)
+    frame = detect_frame(mosaic)
+    if frame is None:
+        log.warning("[%s] could not find the image frame in the scan; using the whole scan",
+                    scene.display_id)
+        frame = (0, 0, mosaic.width, mosaic.height)
+    else:
+        log.info("[%s] image frame x=%d..%d y=%d..%d of %dx%d scan", scene.display_id,
+                 frame[0], frame[2], frame[1], frame[3], mosaic.width, mosaic.height)
+    fx0, fy0, fx1, fy1 = frame
+    image_corners = np.array([[fx0, fy0], [fx1, fy0], [fx1, fy1], [fx0, fy1]], dtype=float)
+    cands = orientation_candidates(ground, fx1 - fx0, fy1 - fy0)
+    source, scores = "user", {}
+    if orientation in ("auto", "all"):
+        best, scores = match_orientation(scene, mosaic, frame, cands, proj, ground)
+        if best:
+            cands.sort(key=lambda c: c[0] != best)
+        source = "usgs-overlay" if best else "default"
     if orientation == "all":
         chosen = cands
     elif orientation == "auto":
         chosen = cands[:1]
+        if source == "default":
+            log.warning("[%s] orientation unverified; assuming %s (try --orientation all)",
+                        scene.display_id, chosen[0][0])
     else:
         chosen = [c for c in cands if c[0].replace(" ", "").upper() == orientation.replace(" ", "").upper()]
         if not chosen:
@@ -842,6 +1019,9 @@ def crop_scene(
                 files=files,
                 footprint_corner_lat_lon={c: scene.corners[c] for c in CORNERS},
                 rectified=rectify,
+                image_frame_px=frame,
+                orientation_source=source,
+                orientation_scores=scores,
             )
         )
         log.info(
